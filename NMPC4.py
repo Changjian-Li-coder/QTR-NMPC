@@ -21,11 +21,11 @@ plt.switch_backend('TkAgg')  # 或使用'Qt5Agg'
 # ====================== 2. 无人机物理参数（完全复用sim_NMPC3.py） ======================
 class UAVParams:
     def __init__(self):
-        self.m = 2.35
+        self.m = 2
         self.L = 0.18
-        self.Ixx = 0.012
-        self.Iyy = 0.012
-        self.Izz = 0.022
+        self.Ixx = 0.01
+        self.Iyy = 0.01
+        self.Izz = 0.02
         self.I = np.diag([self.Ixx, self.Iyy, self.Izz])
         self.g = 9.81
         self.thrust_max = 2.223 * self.g * 4
@@ -38,12 +38,14 @@ class UAVParams:
         self.u_max = np.array([30, 30, self.thrust_max * 0.8, 6, 6, 6])
         self.du_min = np.array([-5, -5, -5, -3, -3, -3])
         self.du_max = np.array([5, 5, 5, 3, 3, 3])
-        self.x_min = np.array([-10, -10, -1, -5, -5, -2,
+        self.x_min = np.array([-10, -10, -1, -5, -5, -0.8,
                                np.deg2rad(-90), np.deg2rad(-90), np.deg2rad(-180),
-                               np.deg2rad(-60), np.deg2rad(-60), np.deg2rad(-60)])
-        self.x_max = np.array([10, 10, 1.5, 5, 5, 2,
+                               np.deg2rad(-60), np.deg2rad(-60), np.deg2rad(-60),
+                               np.deg2rad(-20), np.deg2rad(-20), np.deg2rad(-20)])
+        self.x_max = np.array([10, 10, 1.5, 5, 5, 0.8,
                                np.deg2rad(90), np.deg2rad(90), np.deg2rad(180),
-                               np.deg2rad(60), np.deg2rad(60), np.deg2rad(60)])
+                               np.deg2rad(60), np.deg2rad(60), np.deg2rad(60),
+                               np.deg2rad(20), np.deg2rad(20), np.deg2rad(20)])
 
 # ====================== 3. NMPC超参数（完全复用sim_NMPC3.py） ======================
 class NMPCParams:
@@ -52,29 +54,34 @@ class NMPCParams:
         self.Np = 25   # 预测时域
         self.Nc = 15   # 控制时域
         self.Q = np.diag([45, 45, 20,
+                          10, 10, 5,
+                          5, 5, 2.5,
                           15, 15, 5,
-                          7, 7, 2,
-                          9, 9, 4])  # 状态权重（位置/速度/姿态/角速度）
-        self.P = self.Q * 0.8  # 终端权重（更重视终端状态）
+                          0.001,0.001,0.1])  # 状态权重（位置/速度/姿态/角速度/姿态积分）
+        self.P = self.Q * 0.7  # 终端权重（更重视终端状态）
         self.R = np.diag([0.6, 0.6, 5, 30, 30, 25])  # 控制权重（推力/力矩）
         self.S = np.diag([0.35, 0.35, 1, 15, 15, 10])  # 控制率权重（仅前Nc步）
         # 悬停配平：Fz=mg，其余为0
-        hover_thrust = 2.35 * 9.81
+        hover_thrust = 2 * 9.81
         self.u_trim = np.array([0.0, 0.0, hover_thrust, 0.0, 0.0, 0.0])
 
 # ====================== 4. 动力学模型（完全复用sim_NMPC3.py） ======================
 def build_acados_dynamics_model(uav_params):
-    nx = 12
+    nx = 15  # 状态维度：位置(3) + 速度(3) + 欧拉角(3) + 角速度(3) + 角度误差(3)
     nu = 6
     # 定义CasADi符号变量
     x = ca.SX.sym('x', nx)
     u = ca.SX.sym('u', nu)
     x_dot = ca.SX.sym('x_dot', nx)
+    euler_err = ca.SX.sym('euler_err', 3)  # 角度误差积分量
 
     pos = x[0:3]   # x,y,z
     vel = x[3:6]   # vx,vy,vz (惯性系)
     euler = x[6:9] # phi,theta,psi
     omega = x[9:12]# p,q,r (机体系)
+    euler_int = x[12:15] # 角度误差积分量
+
+
     phi, theta, psi = euler[0], euler[1], euler[2]
     p, q, r = omega[0], omega[1], omega[2]
     # 机体系 → 惯性系 旋转矩阵 R^I_B
@@ -114,14 +121,19 @@ def build_acados_dynamics_model(uav_params):
     deuler_dt = ca.mtimes(T, omega)
     # 4. 角速度导数（转动动力学）
     cross_term = ca.cross(omega, ca.mtimes(uav_params.I, omega))
-    domega_dt = ca.mtimes(ca.inv(uav_params.I), -cross_term + tau_B)
-    dx_dt = ca.vertcat(dp_dt, dv_dt, deuler_dt, domega_dt)
+    tau_compensate = 0.1 * euler_int  # 积分项→力矩补偿（系数可调）
+    domega_dt = ca.mtimes(ca.inv(uav_params.I), -cross_term + tau_B + tau_compensate)
+    # 5. 角度误差积分量导数
+    deuler_int_dt = euler_err  # 积分项导数 = 角度误差
+    dx_dt = ca.vertcat(dp_dt, dv_dt, deuler_dt, domega_dt, deuler_int_dt)
 
     # 构建acados模型
     acados_model = AcadosModel()
     acados_model.name = 'uav_dynamics'
     acados_model.x = x
     acados_model.u = u
+    acados_model.p = euler_err  # 角度误差作为参数输入
+    acados_model.np = 3
     acados_model.xdot = x_dot
     acados_model.f_expl_expr = dx_dt  # 显式动力学
     acados_model.f_impl_expr = x_dot - dx_dt  # 隐式动力学（acados要求）
@@ -134,8 +146,8 @@ class NMPCController:
         self.uav = uav_params
         self.nmpc = nmpc_params
         self.acados_model, self.nx, self.nu = build_acados_dynamics_model(uav_params)
-        self.ny = self.nx + self.nu +self.nu  # 正确维度：12+6+6=24  12维状态，6维控制量，6维控制变化量
-        self.ny_e = self.nx  # 终端代价维度：仅状态12维
+        self.ny = self.nx + self.nu +self.nu  # 正确维度：15+6+6=27  15维状态，6维控制量，6维控制变化量
+        self.ny_e = self.nx  # 终端代价维度：仅状态15维
         self.u_prev = self.nmpc.u_trim
 
         # 初始化OCP问题
@@ -143,6 +155,8 @@ class NMPCController:
         self.ocp.model = self.acados_model
         self.ocp.dims.N = self.nmpc.Np  # 预测时域
         self.ocp.solver_options.tf = self.nmpc.Ts * self.nmpc.Np  # 总预测时间
+
+        self.ocp.parameter_values = np.zeros(3)  # 参数默认值（3维角度误差）
 
         # 状态和控制变量初始化
         self.ocp.constraints.x0 = np.zeros(self.nx)  # 保留默认值，首次odom会覆盖
@@ -157,7 +171,7 @@ class NMPCController:
         self.ocp.cost.cost_type = 'LINEAR_LS'
         self.ocp.cost.cost_type_e = 'LINEAR_LS'
 
-        # 1. 阶段代价权重W：维度必须是(ny, ny) = (24,24) = diag(Q, R, S)
+        # 1. 阶段代价权重W：维度必须是(ny, ny) = (27,27) = diag(Q, R, S)
         self.ocp.cost.W = np.block([
             [self.nmpc.Q, np.zeros((self.nx, self.nu)), np.zeros((self.nx, self.nu))],
             [np.zeros((self.nu, self.nx)), self.nmpc.R, np.zeros((self.nu, self.nu))],
@@ -168,14 +182,14 @@ class NMPCController:
         self.ocp.cost.W_e = self.nmpc.P
 
         # 3. Vx/Vu矩阵：y = Vx·x + Vu·u（y维度18）
-        # Vx: 24x12，对应y = [x; 0; 0]
+        # Vx: 27x15，对应y = [x; 0; 0]
         self.ocp.cost.Vx = np.vstack([
             np.eye(self.nx),
             np.zeros((self.nu, self.nx)),
             np.zeros((self.nu, self.nx))
         ])
 
-        # Vu: 24x6，对应y = [0; u; u]
+        # Vu: 27x6，对应y = [0; u; u]
         self.ocp.cost.Vu = np.vstack([
             np.zeros((self.nx, self.nu)),
             np.eye(self.nu),
@@ -183,12 +197,12 @@ class NMPCController:
         ])
 
         # 4. 终端Vx矩阵：仅状态
-        self.ocp.cost.Vx_e = np.eye(self.nx)  # 12x12
+        self.ocp.cost.Vx_e = np.eye(self.nx)  # 15x15
         self.ocp.cost.Vu_e = np.zeros((self.ny_e, self.nu))  # 终端无控制，补0
 
-        # 5. 参考值初始化：维度匹配ny=24（12状态+6控制+6控制变化）
-        self.ocp.cost.yref = np.zeros(self.ny)  # 24维
-        self.ocp.cost.yref_e = np.zeros(self.ny_e)  # 12维
+        # 5. 参考值初始化：维度匹配ny=27（15状态+6控制+6控制变化）
+        self.ocp.cost.yref = np.zeros(self.ny)  # 27维
+        self.ocp.cost.yref_e = np.zeros(self.ny_e)  # 15维
 
         # ========== 控制增量惩罚：换一种合规方式（约束+代价） ==========
         # 控制增量（Δu）惩罚不通过扩展W实现，而是通过：
@@ -219,10 +233,15 @@ class NMPCController:
         # ========== 新增：开始计时（精确到微秒） ==========
         solve_start = time.perf_counter()
 
+        if len(x0) == 12:
+            x0 = np.concatenate([x0, np.zeros(3)])  # 积分项初始为0
+
         # 安全约束检查
         x0 = np.clip(x0, self.uav.x_min, self.uav.x_max)
 
-        # 更新初始状态
+        # 更新初始状态（扩展后15维，需补0初始化积分项）
+        if len(x0) == 12:
+            x0 = np.concatenate([x0, np.zeros(3)])  # 积分项初始为0
         self.acados_solver.set(0, 'lbx', x0)
         self.acados_solver.set(0, 'ubx', x0)
 
@@ -233,8 +252,9 @@ class NMPCController:
             self.acados_solver.set(i, 'x', x0)
 
         # 更新参考轨迹和代价函数
+        euler_err = None  # 提前定义，避免后续引用报错
         for i in range(self.nmpc.Np):
-            x_ref_i = x_ref[:, i].copy()
+            x_ref_i = np.concatenate([x_ref[:, i].copy(), np.zeros(3)]) # 参考状态：x_ref是12维/列，需扩展到15维（积分项参考为0）
             x_ref_i[8] = self.normalize_angle_np(x_ref_i[8])
 
             # 获取u_{i-1}：i=0时用上一次的u_prev，i>=1时用热启动的u_{i-1}
@@ -242,9 +262,16 @@ class NMPCController:
                 u_prev_i = self.u_prev.copy()
             else:
                 u_prev_i = self.acados_solver.get(i-1, 'u')
+            # 计算角度误差：参考 - 实际
+            euler_actual = x0[6:9] if i == 0 else self.acados_solver.get(i, 'x')[6:9]
+            euler_err =  euler_actual - x_ref_i[6:9]
+            euler_err[2] = self.normalize_angle_np(euler_err[2])  # yaw误差归一化
 
-            # 设置阶段参考：12状态 + 6控制 + 6控制变化 → 18维（匹配ny）
-            yref = np.concatenate([x_ref_i, self.nmpc.u_trim, u_prev_i])  # 18维
+            # 设置参数（角度误差）
+            self.acados_solver.set(i, 'p', euler_err)
+
+            # 设置阶段参考：15状态 + 6控制 + 6控制变化 → 27维（匹配ny）
+            yref = np.concatenate([x_ref_i, self.nmpc.u_trim, u_prev_i])  # 27维
             self.acados_solver.set(i, 'yref', yref)
 
             # 控制率约束（前Nc步）：保留原逻辑，这是Δu的约束，而非代价
@@ -256,7 +283,7 @@ class NMPCController:
                 self.acados_solver.set(i+1, 'ubu', u_prev_step + self.uav.du_max)
 
         # 终端参考（仅状态）→ 12维（匹配ny_e）
-        x_ref_e = x_ref[:, -1].copy()
+        x_ref_e = np.concatenate([x_ref[:, -1].copy(), np.zeros(3)])
         x_ref_e[8] = self.normalize_angle_np(x_ref_i[8])
         self.acados_solver.set(self.nmpc.Np, 'yref', x_ref_e)
 
@@ -280,10 +307,14 @@ class NMPCController:
             u_opt = self.acados_solver.get(0, 'u')
             u_opt = np.clip(u_opt, self.uav.u_min, self.uav.u_max)
             self.u_prev = u_opt
-            # ========== 新增：返回求解时间 ==========
+            # 更新x0的积分项（用于下一帧）
+            integral_limit = np.deg2rad(3)  # 积分限幅±3°
+            euler_int_new = x0[12:15] + euler_err * self.nmpc.Ts
+            x0[12:15] = np.clip(euler_int_new, -integral_limit, integral_limit)  # 限幅
+
             return u_opt, True, solve_time
         except Exception as e:
-            # ========== 新增：失败时也记录时间 ==========
+
             solve_time = time.perf_counter() - solve_start
             self.solve_time_history.append(solve_time)
             print(f"⚠️ NMPC求解失败：{e}，使用悬停配平控制")
@@ -294,18 +325,6 @@ class UAVHostController:
         self.uav_params = UAVParams()
         self.nmpc_params = NMPCParams()
         self.controller = NMPCController(self.uav_params, self.nmpc_params)
-
-        #PI环参数
-        self.kp_roll = 0.06
-        self.ki_roll = 0.1
-        self.kp_pitch = 0.06
-        self.ki_pitch = 0.1
-
-        self.roll_int_limit = 1.5
-        self.pitch_int_limit = 1.5
-
-        self.roll_error_integral = 0.0
-        self.pitch_error_integral = 0.0
 
         # 参考轨迹参数
         self.ref_radius = 1.0
@@ -318,8 +337,8 @@ class UAVHostController:
         self.current_state = None
         self.state_ready = False
         self.t0 = None
-        self.ref_pos_hover = None
-        self.ref_yaw_hover  = None
+        self.ref_pos_hover = np.zeros(3)
+        self.ref_yaw_hover  = 0.0
 
         # 新增：数据记录相关
         self.is_armed = False          # 当前是否解锁
@@ -345,8 +364,6 @@ class UAVHostController:
         # 解锁：开始记录
         if self.is_armed and not prev_armed:
             rospy.loginfo("✅ 无人机解锁，开始记录数据！")
-            self.roll_error_integral = 0.0
-            self.pitch_error_integral = 0.0
             self.is_recording = True
             self.recorded_data = {  # 重置记录数据
                 'time': [],
@@ -384,12 +401,15 @@ class UAVHostController:
 
         self.x_current = np.array([x, y, z, vx, vy, vz, phi, theta, psi, p_rate, q_rate, r_rate])
         if not self.state_ready:
-            # 1. 赋值完整12维初始状态（而非仅位置）
-            self.controller.ocp.constraints.x0 = self.x_current.copy()
+            # 积分项初始化为“当前姿态误差”（参考姿态 - 实际姿态）
+            init_euler_err = np.array([0, 0, self.ref_yaw_hover]) - self.x_current[6:9]
+            init_euler_err[2] = self.controller.normalize_angle_np(init_euler_err[2])
+            x0_15d = np.concatenate([self.x_current, init_euler_err])  # 积分项初始化为误差
+            self.controller.ocp.constraints.x0 = x0_15d.copy()
             # 2. 同步更新acados_solver的初始状态约束（关键！）
-            self.controller.acados_solver.set(0, 'lbx', self.x_current)
-            self.controller.acados_solver.set(0, 'ubx', self.x_current)
-            # rospy.loginfo(f"初始化NMPC初始状态x0：\n{np.array2string(self.x_current, precision=3, suppress_small=True)}")
+            self.controller.acados_solver.set(0, 'lbx', x0_15d)
+            self.controller.acados_solver.set(0, 'ubx', x0_15d)
+
         self.state_ready = True
 
         # 初始化时间戳
@@ -421,20 +441,19 @@ class UAVHostController:
         Ts = self.nmpc_params.Ts
         x_ref = np.zeros((12, Np + 1))
 
-        if self.ref_pos_hover is None:
+        if self.ref_pos_hover[0] == 0:
             self.ref_pos_hover = self.x_current[0:3].copy()
             self.ref_pos_hover[2] = 0.55
-        if self.ref_yaw_hover is None:
+        if self.ref_yaw_hover == 0:
             self.ref_yaw_hover = self.x_current[8].copy()
 
         ref_pos = self.ref_pos_hover.copy()
-        # ref_pos[1] -= 0.3  # 固定y方向偏移
         ref_vel = np.array([0.0, 0.0, 0.0])
         # 平滑收敛：roll/pitch从当前值线性归零（预测时域内逐步收敛）
         current_roll = self.x_current[6]
         current_pitch = self.x_current[7]
         set_roll = np.deg2rad(0.0)
-        set_pitch = np.deg2rad(200.0)  # 实际角度得除10，不知道为啥
+        set_pitch = np.deg2rad(10.0)
         # set_pitch = 2
         roll_decay = np.linspace(current_roll, set_roll, Np+1)  # 逐步归零
         pitch_decay = np.linspace(current_pitch, set_pitch, Np+1)  # 逐步归零
@@ -454,39 +473,6 @@ class UAVHostController:
             x_ref[:, i] = ref_state
 
         return x_ref
-
-    def roll_pitch_pi_compensate(self, u_opt, current_roll, current_pitch, target_roll, target_pitch):
-        # 误差
-        roll_error = target_roll - current_roll
-        pitch_error = target_pitch - current_pitch
-
-        rospy.loginfo_throttle(1,f"roll_error:{roll_error:.4f}  "f"pitch_error:{pitch_error:.4f}")
-
-        # 积分
-        self.roll_error_integral += roll_error * self.nmpc_params.Ts
-        self.pitch_error_integral += pitch_error * self.nmpc_params.Ts
-
-        # 积分限幅
-        self.roll_error_integral = np.clip(self.roll_error_integral, -self.roll_int_limit, self.roll_int_limit)
-        self.pitch_error_integral = np.clip(self.pitch_error_integral, -self.pitch_int_limit, self.pitch_int_limit)
-
-        rospy.loginfo_throttle(1,f"roll_error_integral:{self.roll_error_integral:.4f}  pitch_error_integral:{self.pitch_error_integral:.4f}")
-
-        # PI输出
-        tau_x = self.kp_roll * roll_error + self.ki_roll * self.roll_error_integral
-        tau_y = self.kp_pitch * pitch_error + self.ki_pitch * self.pitch_error_integral
-
-        rospy.loginfo_throttle(1,f"roll_integral:{self.ki_roll * self.roll_error_integral:.4f}  "f"pitch_integral:{self.ki_pitch * self.pitch_error_integral:.4f}")
-
-        # 叠加到力矩
-        u_comp = u_opt.copy()
-        u_comp[3] += tau_x
-        u_comp[4] += tau_y
-
-        # 防超限
-        u_comp = np.clip(u_comp, self.uav_params.u_min, self.uav_params.u_max)
-        rospy.loginfo_throttle(1,f"u_opt:{np.array2string(u_opt[3:6], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}   u_comp:{np.array2string(u_comp[3:6], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
-        return u_comp
 
     def publish_control(self, u):
         """发布NMPC控制量到ROS话题"""
@@ -509,8 +495,8 @@ class UAVHostController:
 
         # 1. 位置 (x,y,z)
         ax1 = axes[0,0]
-        # ax1.plot(time_arr, state_arr[:,0], label='x [m]', linewidth=1.5)
-        # ax1.plot(time_arr, state_arr[:,1], label='y [m]', linewidth=1.5)
+        ax1.plot(time_arr, state_arr[:,0], label='x [m]', linewidth=1.5)
+        ax1.plot(time_arr, state_arr[:,1], label='y [m]', linewidth=1.5)
         ax1.plot(time_arr, state_arr[:,2], label='z [m]', linewidth=1.5)
         ax1.set_title('Position')
         ax1.set_xlabel('Time [s]')
@@ -614,25 +600,17 @@ class UAVHostController:
 
             # 1. 生成参考轨迹
             x_ref = self.generate_reference_trajectory(t_current)
-            # rospy.loginfo_throttle(1, f"参考轨迹x_ref    :{np.array2string(x_ref[:, 0], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
             # rospy.loginfo_throttle(1, f"当前状态x_current:{np.array2string(self.x_current, precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
+            # rospy.loginfo_throttle(1, f"参考轨迹x_ref    :{np.array2string(x_ref[:, 0], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
 
 
             # 2. 求解NMPC
             u_opt, success, solve_time = self.controller.solve(self.x_current, x_ref)
-            # 当前姿态
-            current_roll = self.x_current[6].copy()
-            current_pitch = self.x_current[7].copy()
 
-            # 目标姿态（来自参考轨迹）
-            target_roll = x_ref[6, 0].copy()
-            target_pitch = x_ref[7, 0].copy()
-
-            # PI补偿
-            u_compensated = self.roll_pitch_pi_compensate(u_opt.copy(), current_roll, current_pitch, target_roll, target_pitch)
-
-            # send_u = u_compensated.copy()
             send_u = u_opt.copy()
+            # for i in range(6):
+            #     send_u[i] = send_u[i]  * 0
+            # send_u[1] = -send_u[1]
 
             # 3. 发布控制指令（仅在求解成功时发布，失败则保持上一帧或配平）
             self.publish_control(send_u)
