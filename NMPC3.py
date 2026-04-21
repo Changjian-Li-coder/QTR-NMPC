@@ -448,13 +448,6 @@ class UAVHostController:
 
         return x_ref
 
-
-        # 3. 遍历预测时域，生成每一步的期望状态
-        for i in range(Np + 1):
-            x_ref[:, i] = ref_state
-
-        return x_ref
-
     def roll_pitch_pi_compensate(self, u_opt, current_roll, current_pitch, target_roll, target_pitch):
         # 误差
         roll_error = target_roll - current_roll
