@@ -21,27 +21,27 @@ plt.switch_backend('TkAgg')  # 或使用'Qt5Agg'
 # ====================== 2. 无人机物理参数（完全复用sim_NMPC3.py） ======================
 class UAVParams:
     def __init__(self):
-        self.m = 2.35
+        self.m = 2.4
         self.L = 0.18
-        self.Ixx = 0.012
-        self.Iyy = 0.012
-        self.Izz = 0.022
+        self.Ixx = 0.006
+        self.Iyy = 0.007
+        self.Izz = 0.015
         self.I = np.diag([self.Ixx, self.Iyy, self.Izz])
         self.g = 9.81
-        self.thrust_max = 2.223 * self.g * 4
+        self.thrust = self.m * self.g * 1.2
         self.acceleration_xy_max = 2
         self.acceleration_z_max = 1
         self.roll_pitch_acceleration_max = 3.0
         self.yaw_acceleration_max = 1.0
         self.nu = 6  # u=[Fx,Fy,Fz,τx,τy,τz] 单位：推力：N；力矩：mN·m
-        self.u_min = np.array([-30, -30, -self.thrust_max * 0.8, -6, -6, -6])
-        self.u_max = np.array([30, 30, self.thrust_max * 0.8, 6, 6, 6])
+        self.u_min = np.array([-30, -30, -self.thrust, -6, -6, -6])
+        self.u_max = np.array([30, 30, self.thrust, 6, 6, 6])
         self.du_min = np.array([-5, -5, -5, -3, -3, -3])
         self.du_max = np.array([5, 5, 5, 3, 3, 3])
-        self.x_min = np.array([-10, -10, -1, -5, -5, -2,
+        self.x_min = np.array([-10, -10, -1, -2, -2, -0.5,
                                np.deg2rad(-90), np.deg2rad(-90), np.deg2rad(-180),
                                np.deg2rad(-60), np.deg2rad(-60), np.deg2rad(-60)])
-        self.x_max = np.array([10, 10, 1.5, 5, 5, 2,
+        self.x_max = np.array([10, 10, 1.5, 2, 2, 0.5,
                                np.deg2rad(90), np.deg2rad(90), np.deg2rad(180),
                                np.deg2rad(60), np.deg2rad(60), np.deg2rad(60)])
 
@@ -51,15 +51,15 @@ class NMPCParams:
         self.Ts = 0.01
         self.Np = 25   # 预测时域
         self.Nc = 15   # 控制时域
-        self.Q = np.diag([45, 45, 20,
-                          15, 15, 5,
-                          7, 7, 2,
-                          9, 9, 4])  # 状态权重（位置/速度/姿态/角速度）
+        self.Q = np.diag([45, 45, 18,
+                          15, 15, 22,
+                          5, 5, 2,
+                          18, 18, 4])  # 状态权重（位置/速度/姿态/角速度）
         self.P = self.Q * 0.8  # 终端权重（更重视终端状态）
-        self.R = np.diag([0.6, 0.6, 5, 30, 30, 25])  # 控制权重（推力/力矩）
+        self.R = np.diag([0.6, 0.6, 5.0, 30, 30, 25])  # 控制权重（推力/力矩）
         self.S = np.diag([0.35, 0.35, 1, 15, 15, 10])  # 控制率权重（仅前Nc步）
         # 悬停配平：Fz=mg，其余为0
-        hover_thrust = 2.35 * 9.81
+        hover_thrust = 2.4 * 9.81
         self.u_trim = np.array([0.0, 0.0, hover_thrust, 0.0, 0.0, 0.0])
 
 # ====================== 4. 动力学模型（完全复用sim_NMPC3.py） ======================
@@ -226,11 +226,11 @@ class NMPCController:
         self.acados_solver.set(0, 'lbx', x0)
         self.acados_solver.set(0, 'ubx', x0)
 
-        # ========== 修改4：先热启动（为yref提供u_{i-1}的值） ==========
-        for i in range(self.nmpc.Np):
-            self.acados_solver.set(i, 'u', self.u_prev)
-        for i in range(self.nmpc.Np + 1):
-            self.acados_solver.set(i, 'x', x0)
+        # # ========== 修改4：先热启动（为yref提供u_{i-1}的值） ==========
+        # for i in range(self.nmpc.Np):
+        #     self.acados_solver.set(i, 'u', self.u_prev)
+        # for i in range(self.nmpc.Np + 1):
+        #     self.acados_solver.set(i, 'x', x0)
 
         # 更新参考轨迹和代价函数
         for i in range(self.nmpc.Np):
@@ -257,7 +257,7 @@ class NMPCController:
 
         # 终端参考（仅状态）→ 12维（匹配ny_e）
         x_ref_e = x_ref[:, -1].copy()
-        x_ref_e[8] = self.normalize_angle_np(x_ref_i[8])
+        x_ref_e[8] = self.normalize_angle_np(x_ref_e[8])
         self.acados_solver.set(self.nmpc.Np, 'yref', x_ref_e)
 
         # 热启动（使用上一次的解）
@@ -296,16 +296,12 @@ class UAVHostController:
         self.controller = NMPCController(self.uav_params, self.nmpc_params)
 
         #PI环参数
-        self.kp_roll = 0.06
-        self.ki_roll = 0.1
-        self.kp_pitch = 0.06
-        self.ki_pitch = 0.1
+        self.kp_z = 0.5
+        self.ki_z = 2.0
 
-        self.roll_int_limit = 1.5
-        self.pitch_int_limit = 1.5
+        self.z_int_limit = 1.5
 
-        self.roll_error_integral = 0.0
-        self.pitch_error_integral = 0.0
+        self.z_error_integral = 0.0
 
         # 参考轨迹参数
         self.ref_radius = 1.0
@@ -345,8 +341,7 @@ class UAVHostController:
         # 解锁：开始记录
         if self.is_armed and not prev_armed:
             rospy.loginfo("✅ 无人机解锁，开始记录数据！")
-            self.roll_error_integral = 0.0
-            self.pitch_error_integral = 0.0
+            self.z_error_integral = 0.0
             self.is_recording = True
             self.recorded_data = {  # 重置记录数据
                 'time': [],
@@ -423,7 +418,7 @@ class UAVHostController:
 
         if self.ref_pos_hover is None:
             self.ref_pos_hover = self.x_current[0:3].copy()
-            self.ref_pos_hover[2] = 0.55
+            self.ref_pos_hover[2] = 0.4
         if self.ref_yaw_hover is None:
             self.ref_yaw_hover = self.x_current[8].copy()
 
@@ -434,7 +429,7 @@ class UAVHostController:
         current_roll = self.x_current[6]
         current_pitch = self.x_current[7]
         set_roll = np.deg2rad(0.0)
-        set_pitch = np.deg2rad(200.0)  # 实际角度得除10，不知道为啥
+        set_pitch = np.deg2rad(0.0)  # 实际角度得除10，不知道为啥
         # set_pitch = 2
         roll_decay = np.linspace(current_roll, set_roll, Np+1)  # 逐步归零
         pitch_decay = np.linspace(current_pitch, set_pitch, Np+1)  # 逐步归零
@@ -448,44 +443,33 @@ class UAVHostController:
 
         return x_ref
 
-
-        # 3. 遍历预测时域，生成每一步的期望状态
-        for i in range(Np + 1):
-            x_ref[:, i] = ref_state
-
-        return x_ref
-
-    def roll_pitch_pi_compensate(self, u_opt, current_roll, current_pitch, target_roll, target_pitch):
+    def roll_pitch_pi_compensate(self, u_opt, current_z, target_z):
         # 误差
-        roll_error = target_roll - current_roll
-        pitch_error = target_pitch - current_pitch
+        z_error = target_z - current_z
 
-        rospy.loginfo_throttle(1,f"roll_error:{roll_error:.4f}  "f"pitch_error:{pitch_error:.4f}")
+        rospy.loginfo_throttle(0.1,f"z_error:{z_error:.4f}")
 
         # 积分
-        self.roll_error_integral += roll_error * self.nmpc_params.Ts
-        self.pitch_error_integral += pitch_error * self.nmpc_params.Ts
+        if self.is_armed:
+            self.z_error_integral += z_error * self.nmpc_params.Ts * 1.5
 
         # 积分限幅
-        self.roll_error_integral = np.clip(self.roll_error_integral, -self.roll_int_limit, self.roll_int_limit)
-        self.pitch_error_integral = np.clip(self.pitch_error_integral, -self.pitch_int_limit, self.pitch_int_limit)
+        self.z_error_integral = np.clip(self.z_error_integral, -self.z_int_limit, self.z_int_limit)
 
-        rospy.loginfo_throttle(1,f"roll_error_integral:{self.roll_error_integral:.4f}  pitch_error_integral:{self.pitch_error_integral:.4f}")
+        rospy.loginfo_throttle(0.1,f"z_error_integral:{self.z_error_integral:.4f}")
 
         # PI输出
-        tau_x = self.kp_roll * roll_error + self.ki_roll * self.roll_error_integral
-        tau_y = self.kp_pitch * pitch_error + self.ki_pitch * self.pitch_error_integral
+        T_z = self.kp_z * z_error + self.ki_z * self.z_error_integral
 
-        rospy.loginfo_throttle(1,f"roll_integral:{self.ki_roll * self.roll_error_integral:.4f}  "f"pitch_integral:{self.ki_pitch * self.pitch_error_integral:.4f}")
+        rospy.loginfo_throttle(0.1,f"z_integral:{self.ki_z * self.z_error_integral:.4f}")
 
         # 叠加到力矩
         u_comp = u_opt.copy()
-        u_comp[3] += tau_x
-        u_comp[4] += tau_y
+        u_comp[2] += T_z
 
         # 防超限
         u_comp = np.clip(u_comp, self.uav_params.u_min, self.uav_params.u_max)
-        rospy.loginfo_throttle(1,f"u_opt:{np.array2string(u_opt[3:6], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}   u_comp:{np.array2string(u_comp[3:6], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
+        rospy.loginfo_throttle(0.1,f"u_opt:{np.array2string(u_opt[2], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}   u_comp:{np.array2string(u_comp[2], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
         return u_comp
 
     def publish_control(self, u):
@@ -553,9 +537,9 @@ class UAVHostController:
 
         # 5. 推力 (Fx,Fy,Fz)
         ax5 = axes[2,0]
-        ax5.plot(time_arr, control_arr[:,0], label='Fx [N]', linewidth=1.5)
-        ax5.plot(time_arr, control_arr[:,1], label='Fy [N]', linewidth=1.5)
-        # ax5.plot(time_arr, control_arr[:,2], label='Fz [N]', linewidth=1.5)
+        # ax5.plot(time_arr, control_arr[:,0], label='Fx [N]', linewidth=1.5)
+        # ax5.plot(time_arr, control_arr[:,1], label='Fy [N]', linewidth=1.5)
+        ax5.plot(time_arr, control_arr[:,2], label='Fz [N]', linewidth=1.5)
         ax5.set_title('Thrust (Body Frame)')
         ax5.set_xlabel('Time [s]')
         ax5.set_ylabel('Force [N]')
@@ -621,23 +605,22 @@ class UAVHostController:
             # 2. 求解NMPC
             u_opt, success, solve_time = self.controller.solve(self.x_current, x_ref)
             # 当前姿态
-            current_roll = self.x_current[6].copy()
-            current_pitch = self.x_current[7].copy()
+            current_z = self.x_current[2].copy()
 
             # 目标姿态（来自参考轨迹）
-            target_roll = x_ref[6, 0].copy()
-            target_pitch = x_ref[7, 0].copy()
+            target_z = x_ref[2, 0].copy()
 
             # PI补偿
-            u_compensated = self.roll_pitch_pi_compensate(u_opt.copy(), current_roll, current_pitch, target_roll, target_pitch)
+            u_compensated = self.roll_pitch_pi_compensate(u_opt.copy(), current_z, target_z)
 
-            # send_u = u_compensated.copy()
-            send_u = u_opt.copy()
+            send_u = u_compensated.copy()
+            # send_u = u_opt.copy()
+            send_u[3] = send_u[3] - 0.1  # 补静差
 
             # 3. 发布控制指令（仅在求解成功时发布，失败则保持上一帧或配平）
             self.publish_control(send_u)
             if success :  #and self.is_recording
-                rospy.loginfo_throttle(1, f"求解:{'成功' if success else '失败'}"
+                rospy.loginfo_throttle(0.1, f"求解:{'成功' if success else '失败'}"
                                             f"控制指令: {np.array2string(send_u, precision=4, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
             # 4. 记录数据（仅在解锁时）
             if self.is_recording and self.x_current is not None:
