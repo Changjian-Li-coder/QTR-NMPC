@@ -34,14 +34,14 @@ class UAVParams:
         self.roll_pitch_acceleration_max = 3.0
         self.yaw_acceleration_max = 1.0
         self.nu = 6  # u=[Fx,Fy,Fz,τx,τy,τz] 单位：推力：N；力矩：mN·m
-        self.u_min = np.array([-30, -30, -self.thrust, -6, -6, -6])
-        self.u_max = np.array([30, 30, self.thrust, 6, 6, 6])
+        self.u_min = np.array([-10, -10, -self.thrust, -6, -6, -6])
+        self.u_max = np.array([10, 10, self.thrust, 6, 6, 6])
         self.du_min = np.array([-5, -5, -5, -3, -3, -3])
         self.du_max = np.array([5, 5, 5, 3, 3, 3])
-        self.x_min = np.array([-10, -10, -1, -2, -2, -0.5,
+        self.x_min = np.array([-2, -2, -1, -2, -2, -0.5,
                                np.deg2rad(-90), np.deg2rad(-90), np.deg2rad(-180),
                                np.deg2rad(-60), np.deg2rad(-60), np.deg2rad(-60)])
-        self.x_max = np.array([10, 10, 1.5, 2, 2, 0.5,
+        self.x_max = np.array([2, 2, 1.5, 2, 2, 0.5,
                                np.deg2rad(90), np.deg2rad(90), np.deg2rad(180),
                                np.deg2rad(60), np.deg2rad(60), np.deg2rad(60)])
 
@@ -316,6 +316,7 @@ class UAVHostController:
         self.t0 = None
         self.ref_pos_hover = None
         self.ref_yaw_hover  = None
+        self.reference_trajectory = None  # 存储订阅到的参考轨迹
 
         # 新增：数据记录相关
         self.is_armed = False          # 当前是否解锁
@@ -330,36 +331,8 @@ class UAVHostController:
         # ROS通信（参考NMPC3.py）
         self.pose_sub = rospy.Subscriber("/mavros/local_position/odom", Odometry, self.odom_callback, queue_size=5)
         self.state_sub = rospy.Subscriber("/mavros/state", State, self.state_callback, queue_size=5)
+        self.trajectory_sub = rospy.Subscriber("/uav/reference_trajectory", Float64MultiArray, self.trajectory_callback, queue_size=5)
         self.control_pub = rospy.Publisher("/nmpc/control_cmd", Float64MultiArray, queue_size=5)
-
-    def state_callback(self, msg):
-        """监听mavros/state，检测解锁/上锁状态，触发记录开始/结束"""
-        self.current_state = msg
-        prev_armed = self.is_armed
-        self.is_armed = msg.armed
-
-        # 解锁：开始记录
-        if self.is_armed and not prev_armed:
-            rospy.loginfo("✅ 无人机解锁，开始记录数据！")
-            self.z_error_integral = 0.0
-            self.is_recording = True
-            self.recorded_data = {  # 重置记录数据
-                'time': [],
-                'state': [],
-                'control': [],
-                'solve_time': [],
-                'solve_success': []
-            }
-            self.t0 = rospy.Time.now().to_sec()  # 重置时间戳
-
-        # 上锁：停止记录并绘图
-        if not self.is_armed and prev_armed:
-            rospy.loginfo("🛑 无人机上锁，停止记录并绘图！")
-            self.is_recording = False
-            if len(self.recorded_data['time']) > 0:
-                self.plot_recorded_data()  # 绘制数据
-            else:
-                rospy.logwarn("⚠️ 无记录数据，跳过绘图")
 
     def odom_callback(self, msg):
         """从/mavros/local_position/odom更新12维状态（坐标转换完全参考NMPC3.py）"""
@@ -391,57 +364,79 @@ class UAVHostController:
         if self.t0 is None:
             self.t0 = rospy.Time.now().to_sec()
 
-    # def generate_reference_trajectory(self, t_current):
-    #     Np = self.nmpc_params.Np  # 预测时域步长
-    #     Ts = self.nmpc_params.Ts  # 控制周期
-    #     x_ref = np.zeros((12, Np + 1))
+    def trajectory_callback(self, msg):
+        """订阅参考轨迹话题，重塑为12×(Np+1)数组"""
+        try:
+            # 解析展平的轨迹数据，重塑为12×(Np+1)
+            traj_flat = np.array(msg.data)
+            if traj_flat.size != self.controller.nx:
+                rospy.logwarn(f"⚠️ 轨迹数据维度不匹配：收到{traj_flat.size}，期望{self.controller.nx}")
+                return
+            self.reference_trajectory = traj_flat
+        except Exception as e:
+            rospy.logwarn(f"⚠️ 解析轨迹数据失败：{e}")
 
-    #     # 1. 固定参考目标：位置=当前位置（悬停），姿态=零姿态（roll/pitch=0），速度=0，角速度=0
-    #     if self.ref_pos_hover is None:
-    #         self.ref_pos_hover = self.x_current[0:3].copy()  # 记录初始位置作为悬停目标
-    #         self.ref_pos_hover[2] = 0.55  # 固定高度
-    #     if self.ref_yaw_hover is None:
-    #         self.ref_yaw_hover = self.x_current[8].copy()
+    def state_callback(self, msg):
+        """监听mavros/state，检测解锁/上锁状态，触发记录开始/结束"""
+        self.current_state = msg
+        prev_armed = self.is_armed
+        self.is_armed = msg.armed
 
-    #     ref_pos = self.ref_pos_hover.copy()  # 参考位置固定为初始解锁点
-    #     ref_vel = np.array([0.0, 0.0, 0.0])          # 速度强制归零
-    #     ref_euler = np.array([0.0, 0.0, 0.0])  # roll/pitch=0，偏航保持当前
-    #     ref_euler[2] = self.ref_yaw_hover.copy()
-    #     ref_omega = np.array([0.0, 0.0, 0.0]) # 角速度强制归零
+        # 解锁：开始记录
+        if self.is_armed and not prev_armed:
+            rospy.loginfo("✅ 无人机解锁，开始记录数据！")
+            self.z_error_integral = 0.0
+            self.is_recording = True
+            self.recorded_data = {  # 重置记录数据
+                'time': [],
+                'state': [],
+                'control': [],
+                'solve_time': [],
+                'solve_success': []
+            }
+            self.t0 = rospy.Time.now().to_sec()  # 重置时间戳
 
-    #     # 2. 预测时域内所有步的参考状态都固定为零姿态目标（无逐步收敛，直接强制零姿态）
-    #     ref_state = np.concatenate([ref_pos, ref_vel, ref_euler, ref_omega])
+        # 上锁：停止记录并绘图
+        if not self.is_armed and prev_armed:
+            rospy.loginfo("🛑 无人机上锁，停止记录并绘图！")
+            self.is_recording = False
+            if len(self.recorded_data['time']) > 0:
+                self.plot_recorded_data()  # 绘制数据
+            else:
+                rospy.logwarn("⚠️ 无记录数据，跳过绘图")
+
     def generate_reference_trajectory(self, t_current):
+        """替换为订阅外部轨迹的逻辑"""
         Np = self.nmpc_params.Np
-        Ts = self.nmpc_params.Ts
-        x_ref = np.zeros((12, Np + 1))
-
-        if self.ref_pos_hover is None:
-            self.ref_pos_hover = self.x_current[0:3].copy()
-            self.ref_pos_hover[2] = 0.5
-        if self.ref_yaw_hover is None:
-            self.ref_yaw_hover = self.x_current[8].copy()
-
-        ref_pos = self.ref_pos_hover.copy()
-        ref_pos[1] -= 0.3  # 固定y方向s偏移
-        ref_vel = np.array([0.0, 0.0, 0.0])
-        # 平滑收敛：roll/pitch从当前值线性归零（预测时域内逐步收敛）
-        current_roll = self.x_current[6]
-        current_pitch = self.x_current[7]
-        set_roll = np.deg2rad(0.0)
-        set_pitch = np.deg2rad(0.0)  # 实际角度得除10，不知道为啥
-        # set_pitch = 2
-        roll_decay = np.linspace(current_roll, set_roll, Np+1)  # 逐步归零
-        pitch_decay = np.linspace(current_pitch, set_pitch, Np+1)  # 逐步归零
-        ref_omega = np.array([0.0, 0.0, 0.0])
-
-        for i in range(Np + 1):
-            ref_euler = np.array([set_roll, set_pitch, self.ref_yaw_hover])
-            # ref_euler = np.array([roll_decay[i], pitch_decay[i], self.ref_yaw_hover])
+        # 兜底：未收到外部轨迹时，生成悬停轨迹（兼容原有逻辑）
+        if self.reference_trajectory is None:
+            rospy.logwarn_throttle(1, "⚠️ 未收到外部参考轨迹，使用本地悬停轨迹")
+            x_ref = np.zeros((12, Np + 1))
+            if self.ref_pos_hover is None:
+                self.ref_pos_hover = self.x_current[0:3].copy()
+                self.ref_pos_hover[2] = 0.55
+            if self.ref_yaw_hover is None:
+                self.ref_yaw_hover = self.x_current[8].copy()
+            ref_pos = self.ref_pos_hover.copy()
+            ref_vel = np.array([0.0, 0.0, 0.0])
+            ref_euler = np.array([0.0, 0.0, self.ref_yaw_hover])
+            ref_omega = np.array([0.0, 0.0, 0.0])
             ref_state = np.concatenate([ref_pos, ref_vel, ref_euler, ref_omega])
-            x_ref[:, i] = ref_state
+            for i in range(Np + 1):
+                x_ref[:, i] = ref_state
+            return x_ref
+        # 直接返回订阅到的外部轨迹
+        else:
+            x_ref = np.zeros((12, Np + 1))
+            start_state = self.x_current.copy()
+            target_state = self.reference_trajectory[0:12].copy()
 
-        return x_ref
+            for i in range(Np + 1):
+                alpha = i / self.nmpc_params.Np
+                # x_ref[:, i] = (1 - alpha) * start_state + alpha * target_state
+                x_ref[:, i] = target_state  # 直接使用目标状态作为参考轨迹
+                x_ref[8, i] = (x_ref[8, i] + np.pi) % (2 * np.pi) - np.pi  # 确保yaw角连续
+            return x_ref
 
     def z_pi_compensate(self, u_opt, current_z, target_z):
         # 误差
@@ -493,9 +488,9 @@ class UAVHostController:
 
         # 1. 位置 (x,y,z)
         ax1 = axes[0,0]
-        # ax1.plot(time_arr, state_arr[:,0], label='x [m]', linewidth=1.5)
+        ax1.plot(time_arr, state_arr[:,0], label='x [m]', linewidth=1.5)
         ax1.plot(time_arr, state_arr[:,1], label='y [m]', linewidth=1.5)
-        ax1.plot(time_arr, state_arr[:,2], label='z [m]', linewidth=1.5)
+        # ax1.plot(time_arr, state_arr[:,2], label='z [m]', linewidth=1.5)
         ax1.set_title('Position')
         ax1.set_xlabel('Time [s]')
         ax1.set_ylabel('Position [m]')
@@ -598,7 +593,7 @@ class UAVHostController:
 
             # 1. 生成参考轨迹
             x_ref = self.generate_reference_trajectory(t_current)
-            rospy.loginfo_throttle(1, f"参考轨迹x_ref    :{np.array2string(x_ref[:, 0], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
+            rospy.loginfo_throttle(1, f"参考轨迹x_ref    :{np.array2string(x_ref[:, -1], precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
             # rospy.loginfo_throttle(1, f"当前状态x_current:{np.array2string(self.x_current, precision=3, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
 
 
@@ -616,12 +611,13 @@ class UAVHostController:
             send_u = u_compensated.copy()
             # send_u = u_opt.copy()
             send_u[3] = send_u[3] - 0.1  # 补静差
+            # send_u[5] = 0.0  # 取消偏航力矩，保持当前航向
 
             # 3. 发布控制指令（仅在求解成功时发布，失败则保持上一帧或配平）
             self.publish_control(send_u)
-            if success :  #and self.is_recording
-                rospy.loginfo_throttle(0.1, f"求解:{'成功' if success else '失败'}"
-                                            f"控制指令: {np.array2string(send_u, precision=4, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
+            # if success :  #and self.is_recording
+            #     rospy.loginfo_throttle(0.1, f"求解:{'成功' if success else '失败'}"
+            #                                 f"控制指令: {np.array2string(send_u, precision=4, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
             # 4. 记录数据（仅在解锁时）
             if self.is_recording and self.x_current is not None:
                 self.recorded_data['time'].append(t_current)
