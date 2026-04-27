@@ -251,7 +251,7 @@ class NMPCController:
         solver_opts = {
             "ipopt": {
                 "max_iter": 50, # 增加最大迭代次数，提升求解成功率
-                "print_level": 0, # 0-3逐级增加求解日志输出，调试时可设置为1或2
+                "print_level": 3, # 0-3逐级增加求解日志输出，调试时可设置为1或2
                 "tol": 1e-2, # 适当放宽求解精度要求，提升求解速度和成功率
                 "acceptable_tol": 1e-1, # 允许的求解精度，启用后在达到acceptable_tol时提前终止，提升求解效率
                 "acceptable_obj_change_tol": 1e-1, # 允许的目标函数变化率，启用后在目标函数变化率小于该值时提前终止，提升求解效率
@@ -266,7 +266,7 @@ class NMPCController:
                 "linear_solver": "mumps",      # 保持MUMPS（如果有HSL MA27/MA57，换成"ma27"或"ma57"，速度再快2~3倍）
                 "mumps_pivtol": 1e-6,          # MUMPS枢轴容差（加速MUMPS求解）
             },
-            "print_time": 0
+            "print_time": 1
         }
 
         self.opti.solver("ipopt", solver_opts)
