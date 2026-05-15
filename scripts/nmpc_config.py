@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from uav_config import UAVParams
+import numpy as np
+class NMPCParams:
+    def __init__(self):
+        self.Ts = 0.015 # 预测步长
+        self.Np = 12   # 预测时域
+        self.Nc = 5    # 控制时域
+
+        self.nx = 18 # 状态维度：12维原状态 + 6维积分状态
+        self.nx_original = 12 # 原状态维度
+        self.nx_integral = 6 # 积分状态维度
+        self.nu = 6  # 控制量维度：[Fx,Fy,Fz,τx,τy,τz]
+
+        self.uav_params = UAVParams()
+        # # 状态权重：12维原状态 + 6维积分状态
+        # self.Q = np.diag([
+        #     200, 200, 100,          # 位置 (x,y,z) - 保持
+        #     20, 20, 60,    # 速度 (vx,vy,vz) - 保持
+        #     10.0, 10.0, 6.0,     # 姿态 (roll/pitch/yaw)：从150→100（降低超调），仍高于初始80
+        #     10.0, 10.0, 10.0,    # 角速度 (p,q,r)：从8e3→5e3（降低阻尼过强），仍高于初始4e3
+        #     20.0, 20.0, 20.0,          # 位置误差积分 - 保持
+        #     100.0, 100.0, 40.0           # 姿态误差积分：从0.4→1.0（提升积分阻尼，抑制积分累积震荡）
+        # ])
+        # self.P = self.Q * 0.8  # 终端权重略低，保证终端收敛温和
+        # # 控制量权重：[Fx,Fy,Fz,τx,τy,τz] - 避免控制量饱和9
+        # self.R = np.diag([
+        #     0.5, 0.5, 2.0,        # Fx/Fy（水平推力）权重高（限制过载），Fz（主推力）权重低（允许调整）
+        #     55.0, 55.0, 40.0        # τx/τy（滚转/俯仰力矩）权重高，τz（偏航力矩）权重低
+        # ])
+        # # 控制率权重：平滑控制输入，避免倾转机构突变
+        # self.S = np.diag([
+        #     0.3, 0.3, 1.0,          # Fx/Fy控制率权重高，Fz控制率权重低
+        #     20.0, 20.0, 30.0        # 力矩控制率 - 匹配倾转机构动态特性
+        # ])
+
+        # 悬停配平
+        self.hover_thrust = self.uav_params.m * self.uav_params.g
+        self.u_trim = np.array([0.0, 0.0, self.hover_thrust, 0.0, 0.0, 0.0])
+
+        self.u_min = np.array([-30, -30, -self.hover_thrust, -6, -6, -6])
+        self.u_max = np.array([30, 30, self.hover_thrust * 1.5, 6, 6, 6])
+        self.du_min = np.array([-5, -5, -5, -3, -3, -3])
+        self.du_max = np.array([5, 5, 5, 3, 3, 3])
+        
+        # 原12维状态约束 + 6维积分状态约束（积分项限幅）
+        x_original_min = np.array([-10, -10, -1, -2, -2, -0.3,
+                                   np.deg2rad(-90), np.deg2rad(-90), np.deg2rad(-180),
+                                   np.deg2rad(-60), np.deg2rad(-60), np.deg2rad(-60)])
+        x_integral_min = np.array([-5.0, -5.0, -2.0,  # 位置误差积分限幅
+                                   np.deg2rad(-45), np.deg2rad(-45), np.deg2rad(-90)])  # 姿态误差积分限幅
+        self.x_min = np.hstack([x_original_min, x_integral_min])  # 增广后18维状态下界
+        
+        x_original_max = np.array([10, 10, 1.5, 2, 2, 0.5,
+                                   np.deg2rad(90), np.deg2rad(90), np.deg2rad(180),
+                                   np.deg2rad(60), np.deg2rad(60), np.deg2rad(60)])
+        x_integral_max = np.array([5.0, 5.0, 2.0,
+                                   np.deg2rad(45), np.deg2rad(45), np.deg2rad(90)])
+        self.x_max = np.hstack([x_original_max, x_integral_max])  # 增广后18维状态上界
+
+
+#能用
+        # self.Q = np.diag([
+        #     80, 80, 100,          # 位置 (x,y,z) - 保持
+        #     20, 20, 60,    # 速度 (vx,vy,vz) - 保持
+        #     12.0, 12.0, 6.0,     # 姿态 (roll/pitch/yaw)：从150→100（降低超调），仍高于初始80
+        #     10.0, 10.0, 10.0,    # 角速度 (p,q,r)：从8e3→5e3（降低阻尼过强），仍高于初始4e3
+        #     20.0, 20.0, 20.0,          # 位置误差积分 - 保持
+        #     40.0, 40.0, 40.0           # 姿态误差积分：从0.4→1.0（提升积分阻尼，抑制积分累积震荡）
+        # ])
+        # self.P = self.Q * 0.8  # 终端权重略低，保证终端收敛温和
+        # # 控制量权重：[Fx,Fy,Fz,τx,τy,τz] - 避免控制量饱和9
+        # self.R = np.diag([
+        #     0.5, 0.5, 2.0,        # Fx/Fy（水平推力）权重高（限制过载），Fz（主推力）权重低（允许调整）
+        #     50.0, 50.0, 40.0        # τx/τy（滚转/俯仰力矩）权重高，τz（偏航力矩）权重低
+        # ])
+        # # 控制率权重：平滑控制输入，避免倾转机构突变
+        # self.S = np.diag([
+        #     0.3, 0.3, 1.0,          # Fx/Fy控制率权重高，Fz控制率权重低
+        #     20.0, 20.0, 30.0        # 力矩控制率 - 匹配倾转机构动态特性
+        # ])
+
+# 10 
+        # 状态权重：12维原状态 + 6维积分状态
+        self.Q = np.diag([
+            200, 200, 100,          # 位置 (x,y,z) - 保持
+            20, 20, 60,    # 速度 (vx,vy,vz) - 保持
+            10.0, 10.0, 6.0,     # 姿态 (roll/pitch/yaw)：从150→100（降低超调），仍高于初始80
+            10.0, 10.0, 10.0,    # 角速度 (p,q,r)：从8e3→5e3（降低阻尼过强），仍高于初始4e3
+            20.0, 20.0, 20.0,          # 位置误差积分 - 保持
+            100.0, 100.0, 40.0           # 姿态误差积分：从0.4→1.0（提升积分阻尼，抑制积分累积震荡）
+        ])
+        self.P = self.Q * 0.8  # 终端权重略低，保证终端收敛温和
+        # 控制量权重：[Fx,Fy,Fz,τx,τy,τz] - 避免控制量饱和9
+        self.R = np.diag([
+            0.5, 0.5, 2.0,        # Fx/Fy（水平推力）权重高（限制过载），Fz（主推力）权重低（允许调整）
+            55.0, 55.0, 40.0        # τx/τy（滚转/俯仰力矩）权重高，τz（偏航力矩）权重低
+        ])
+        # 控制率权重：平滑控制输入，避免倾转机构突变
+        self.S = np.diag([
+            0.3, 0.3, 1.0,          # Fx/Fy控制率权重高，Fz控制率权重低
+            20.0, 20.0, 30.0        # 力矩控制率 - 匹配倾转机构动态特性
+        ])
