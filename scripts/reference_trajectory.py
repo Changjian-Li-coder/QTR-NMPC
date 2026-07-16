@@ -19,6 +19,7 @@
 from nmpc_config import NMPCParams
 import numpy as np
 from enum import Enum
+from scipy.interpolate import CubicSpline
 
 
 class TrajectoryType(Enum):
@@ -59,6 +60,8 @@ class ReferenceTrajectory:
         self.circle_radius = 1.0           # 半径 [m]
         self.circle_omega = 0.5            # 角速度 [rad/s]（正=逆时针）
         self.circle_phase = 0.0            # 当前相位 [rad]
+        self.circle_revolutions = 1.0      # 圈数（完成指定圈数后结束轨迹）
+        self._circle_phase_start = 0.0     # 起始相位，用于计算已转圈数
 
         # ================== 8字轨迹 参数 ==================
         self.f8_center = np.zeros(2)       # 交汇点 [x, y]
@@ -125,7 +128,16 @@ class ReferenceTrajectory:
 
         Returns: bool
         """
-        # 非 LINE 类型（圆/8字/往返等）用原有 _trajectory_done 标记
+        # CIRCLE 类型：检测是否完成指定圈数
+        if self.traj_type == TrajectoryType.CIRCLE:
+            phase_traversed = self.circle_phase - self._circle_phase_start
+            total_target = 2.0 * np.pi * self.circle_revolutions
+            if phase_traversed >= total_target:
+                if not self._trajectory_done:
+                    self._trajectory_done = True
+                return True
+            return False
+        # 非 LINE/非 CIRCLE 类型（8字/往返等）用原有 _trajectory_done 标记
         if self.traj_type != TrajectoryType.LINE:
             return self._trajectory_done
         # LINE 类型：距离 + 保持时间
@@ -264,16 +276,17 @@ class ReferenceTrajectory:
         self.traj_time = 0.0
         return self
 
-    def init_circle(self, center, radius, omega=0.5, z=1.0, phase_init=0.0):
+    def init_circle(self, center, radius, omega=0.5, z=0.5, phase_init=0.0, revolutions=2.0):
         """
         初始化圆形轨迹
 
         Args:
-            center:    [x, y] 或 [x, y, z] 圆心坐标
-            radius:    半径 [m]
-            omega:     角速度 [rad/s]（正=逆时针，负=顺时针）
-            z:         飞行高度 [m]（center 只给2维时使用）
+            center:     [x, y] 或 [x, y, z] 圆心坐标
+            radius:     半径 [m]
+            omega:      角速度 [rad/s]（正=逆时针，负=顺时针）
+            z:          飞行高度 [m]（center 只给2维时使用）
             phase_init: 初始相位 [rad]
+            revolutions: 圈数（完成指定圈数后自动结束）
 
         Returns: self
         """
@@ -286,6 +299,8 @@ class ReferenceTrajectory:
         self.circle_radius = max(float(radius), 0.1)
         self.circle_omega = float(omega)
         self.circle_phase = float(phase_init)
+        self.circle_revolutions = float(revolutions)
+        self._circle_phase_start = self.circle_phase
         # 重置任务状态
         self._trajectory_done = False
         self._landing_active = False
@@ -357,7 +372,7 @@ class ReferenceTrajectory:
         elif self.traj_type == TrajectoryType.LINE_ROUNDTRIP:
             x_ref = self._generate_line_roundtrip()
         elif self.traj_type == TrajectoryType.CIRCLE:
-            x_ref = self._generate_circle()
+            x_ref = self._generate_circle(x_current)
         elif self.traj_type == TrajectoryType.FIGURE8:
             x_ref = self._generate_figure8()
         else:
@@ -571,39 +586,106 @@ class ReferenceTrajectory:
 
         return x_ref
 
-    def _generate_circle(self):
-        """生成圆形轨迹片段"""
+    def _generate_circle(self, x_current=None):
+        """
+        生成圆形轨迹片段（目标点跟踪模式）
+
+        以无人机实际位置为起点，计算圆上预测时域末端的目
+        标点，用三次样条平滑插值，使 NMPC 始终跟踪圆上一
+        个不断前进的动点，抑制位置偏差。
+
+        Args:
+            x_current: 当前12维状态 [x,y,z, vx,vy,vz, roll,pitch,yaw, wx,wy,wz]
+
+        Returns:
+            x_ref: np.ndarray, shape [12, Np+1]
+        """
         x_ref = np.zeros((12, self.Np + 1))
-        t_grid = np.linspace(0, self.Np * self.dt, self.Np + 1)
+        t_total = self.Np * self.dt
+        t = np.linspace(0, t_total, self.Np + 1)
+        t_waypoints = np.array([0, t_total])
 
-        for i, dt_i in enumerate(t_grid):
-            theta = self.circle_phase + self.circle_omega * dt_i
+        # ---- 根据无人机实际位置更新相位（抑制累积误差） ----
+        # 新参数方程: x=cx+R·sin(θ), y=cy+R·cos(θ) → θ=atan2(x-cx, y-cy)
+        if x_current is not None:
+            dx = x_current[0] - self.circle_center[0]
+            dy = x_current[1] - self.circle_center[1]
+            # 即使恰好在圆心也 safe
+            actual_phase = np.arctan2(dx, dy)
+            # 解缠绕：使 circle_phase 连续跟踪无人机实际角度
+            phase_diff = self.normalize_angle_np(actual_phase - self.circle_phase)
+            self.circle_phase += phase_diff
 
-            # ---- 位置 ----
-            x = self.circle_center[0] + self.circle_radius * np.cos(theta)
-            y = self.circle_center[1] + self.circle_radius * np.sin(theta)
-            z = self.circle_center[2]
-            x_ref[0:3, i] = [x, y, z]
+        # ---- 目标相位：预测时域末端在圆上的位置 ----
+        target_theta = self.circle_phase + self.circle_omega * t_total
 
-            # ---- 速度（解析导数） ----
-            vx = -self.circle_radius * self.circle_omega * np.sin(theta)
-            vy = self.circle_radius * self.circle_omega * np.cos(theta)
-            vz = 0.0
-            x_ref[3:6, i] = np.clip([vx, vy, vz], -self.max_v, self.max_v)
+        # ---- 目标位置 (x=cx+R·sinθ, y=cy+R·cosθ) ----
+        target_pos = np.array([
+            self.circle_center[0] + self.circle_radius * np.sin(target_theta),
+            self.circle_center[1] + self.circle_radius * np.cos(target_theta),
+            self.circle_center[2]
+        ])
 
-            # ---- 欧拉角（偏航指向速度切线方向） ----
-            x_ref[6, i] = self.roll
-            x_ref[7, i] = self.pitch
-            x_ref[8, i] = np.arctan2(vy, vx)
+        # ---- 目标速度（圆上切线方向: vx=R·ω·cosθ, vy=-R·ω·sinθ） ----
+        target_vel = np.array([
+            self.circle_radius * self.circle_omega * np.cos(target_theta),
+            -self.circle_radius * self.circle_omega * np.sin(target_theta),
+            0.0
+        ])
+        target_vel = np.clip(target_vel, -self.max_v, self.max_v)
 
-            # ---- 角速度 ----
-            # 偏航角速度 = 圆周角速度（偏航跟随圆周运动）
-            x_ref[9:12, i] = [0.0, 0.0, self.circle_omega]
+        # ---- 目标偏航（指向飞行方向） ----
+        target_yaw = np.arctan2(target_vel[1], target_vel[0])
 
-        # 滑动：更新相位
-        self.circle_phase += self.circle_omega * self.Np * self.dt
-        self.circle_phase = self.normalize_angle_np(self.circle_phase)
+        if x_current is not None:
+            # ======== 模式A：有当前位置 → 三次样条插值 ========
+            current_pos = x_current[0:3]
+            current_vel = x_current[3:6]
 
+            # 位置插值：起点速度=当前速度，终点速度=目标速度
+            for dim in range(3):
+                y_wp = [current_pos[dim], target_pos[dim]]
+                cs_pos = CubicSpline(t_waypoints, y_wp,
+                                     bc_type=((1, current_vel[dim]), (1, target_vel[dim])))
+                x_ref[dim, :] = cs_pos(t)
+                x_ref[dim + 3, :] = cs_pos(t, 1)
+                x_ref[dim + 3, :] = np.clip(x_ref[dim + 3, :],
+                                            -self.max_v[dim], self.max_v[dim])
+
+            # 欧拉角：roll/pitch 保持水平，yaw 平滑过渡
+            x_ref[6, :] = 0.0
+            x_ref[7, :] = 0.0
+            current_yaw = x_current[8]
+            y_wp = [self.normalize_angle_np(current_yaw), target_yaw]
+            cs_yaw = CubicSpline(t_waypoints, y_wp,
+                                 bc_type=((1, 0.0), (1, 0.0)))
+            yaw_traj = self.normalize_angle_np(cs_yaw(t))
+            x_ref[8, :] = 0
+
+            # 角速度：对偏航有限差分
+            x_ref[9:12, :] = 0.0
+            for i in range(1, self.Np + 1):
+                dyaw = self.normalize_angle_np(yaw_traj[i] - yaw_traj[i - 1])
+                # x_ref[11, i] = dyaw / self.dt
+                x_ref[11, i] = 0
+        else:
+            # ======== 模式B：无当前位置 → 直接生成圆上轨迹（降级） ========
+            # 参数方程: x=cx+R·sinθ, y=cy+R·cosθ, vx=R·ω·cosθ, vy=-R·ω·sinθ
+            for i, dt_i in enumerate(t):
+                theta = self.circle_phase + self.circle_omega * dt_i
+                x_ref[0, i] = self.circle_center[0] + self.circle_radius * np.sin(theta)
+                x_ref[1, i] = self.circle_center[1] + self.circle_radius * np.cos(theta)
+                x_ref[2, i] = self.circle_center[2]
+                vx = self.circle_radius * self.circle_omega * np.cos(theta)
+                vy = -self.circle_radius * self.circle_omega * np.sin(theta)
+                x_ref[3:6, i] = np.clip([vx, vy, 0.0], -self.max_v, self.max_v)
+                x_ref[6, i] = 0.0
+                x_ref[7, i] = 0.0
+                x_ref[8, i] = np.arctan2(vy, vx)
+                # 偏航角速度: yaw=atan2(vy,vx), 对θ求导得 -ω
+                x_ref[9:12, i] = [0.0, 0.0, -self.circle_omega]
+
+        # ⚡ 相位已在函数开头由实际位置更新，此处不再时间递推
         return x_ref
 
     def _generate_figure8(self):

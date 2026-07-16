@@ -193,22 +193,22 @@ class AcadosModelBuilder:
             self.u_prev = u_opt
 
             # 输出acados求解器内部每一步的x状态
-            # rospy.loginfo("===== ACADOS求解器各阶段状态x =====")
-            # for i in range(self.nmpc_params.Np + 1):  # 包含终端状态，所以是Np+1
-            #     x_i = self.acados_solver.get(i, 'x')
-            #     rospy.loginfo(f"第{i}步状态x: {np.array2string(x_i, precision=4, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
-            #     # 如果需要更详细的分类输出（位置、速度、姿态等），可以取消下面的注释
-            #     # pos = x_i[0:3]
-            #     # vel = x_i[3:6]
-            #     # euler = x_i[6:9]
-            #     # angular_vel = x_i[9:12]
-            #     # integral = x_i[12:]
-            #     # rospy.loginfo(f"第{i}步 - 位置: {np.round(pos,4)}, 速度: {np.round(vel,4)}, 姿态: {np.round(euler,4)}, 角速度: {np.round(angular_vel,4)}, 积分项: {np.round(integral,4)}")
-            # rospy.loginfo("====== ACADOS求解器各阶段状态u =======")
-            # for i in range (self.nmpc_params.Nc):
-            #     u_i = self.acados_solver.get(i, 'u')
-            #     rospy.loginfo(f"第{i}步控制u: {np.array2string(u_i, precision=4, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
-            # rospy.loginfo("=====================================")
+            rospy.loginfo("===== ACADOS求解器各阶段状态x =====")
+            for i in range(self.nmpc_params.Np + 1):  # 包含终端状态，所以是Np+1
+                x_i = self.acados_solver.get(i, 'x')
+                rospy.loginfo(f"第{i}步状态x: {np.array2string(x_i, precision=4, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
+                # 如果需要更详细的分类输出（位置、速度、姿态等），可以取消下面的注释
+                # pos = x_i[0:3]
+                # vel = x_i[3:6]
+                # euler = x_i[6:9]
+                # angular_vel = x_i[9:12]
+                # integral = x_i[12:]
+                # rospy.loginfo(f"第{i}步 - 位置: {np.round(pos,4)}, 速度: {np.round(vel,4)}, 姿态: {np.round(euler,4)}, 角速度: {np.round(angular_vel,4)}, 积分项: {np.round(integral,4)}")
+            rospy.loginfo("====== ACADOS求解器各阶段状态u =======")
+            for i in range (self.nmpc_params.Nc):
+                u_i = self.acados_solver.get(i, 'u')
+                rospy.loginfo(f"第{i}步控制u: {np.array2string(u_i, precision=4, floatmode='fixed', suppress_small=True, max_line_width=1000)}")
+            rospy.loginfo("=====================================")
             return u_opt, True, solve_time
         except Exception as e:
             solve_time = time.perf_counter() - solve_start
